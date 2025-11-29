@@ -1,21 +1,23 @@
 'use server';
 
 import { Company } from './lib/types';
-import { Pool } from 'pg';
-import zlib from 'zlib';
-import { promisify } from 'util';
-const gunzip = promisify(zlib.gunzip);
+import { MongoClient } from 'mongodb';
 import { cookies, headers } from 'next/headers';
 import { checkRateLimit, isUserLoggedIn, verifyUser } from './lib/auth';
 import { redirect } from 'next/navigation';
-import fs from 'fs';
-import path from 'path';
-import { SearchIndex } from './lib/types';
 
-const pool = new Pool({
-    connectionString: process.env.POSTGRES_URL,
-    ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined
-});
+let client: MongoClient | null = null;
+
+async function getClient() {
+    if (!client) {
+        if (!process.env.MONGODB_URI) {
+            throw new Error('MONGODB_URI is missing');
+        }
+        client = new MongoClient(process.env.MONGODB_URI);
+        await client.connect();
+    }
+    return client;
+}
 
 export async function loginAction(formData: FormData) {
     const username = formData.get('username') as string;
@@ -40,39 +42,59 @@ export async function logoutAction() {
     redirect('/');
 }
 
-const INDEX_FILE = path.join(process.cwd(), 'public', 'data', 'search-index.json.gz');
-const DATA_DIR = path.join(process.cwd(), 'public', 'data');
+export async function searchCompanies(query: string): Promise<{ results: Company[], error?: string, remaining?: number, isPremium?: boolean }> {
+    if (!query || query.length < 2) return { results: [] };
 
-async function searchInFileIndex(query: string): Promise<Company[]> {
-    console.log('Falling back to file-based search...');
-    if (!fs.existsSync(INDEX_FILE)) return [];
+    const isLoggedIn = await isUserLoggedIn();
+    let remaining = -1;
+
+    if (!isLoggedIn) {
+        const headersList = await headers();
+        const ip = headersList.get('x-forwarded-for') || '127.0.0.1';
+
+        const limit = await checkRateLimit(ip);
+        if (!limit.allowed) {
+            return {
+                results: [],
+                error: 'Free search limit exceeded (10/day). Please login for unlimited access.',
+                remaining: 0,
+                isPremium: false
+            };
+        }
+        remaining = limit.remaining;
+    }
 
     try {
-        const buffer = fs.readFileSync(INDEX_FILE);
-        const jsonString = (await gunzip(buffer)).toString('utf-8');
-        const index: SearchIndex[] = JSON.parse(jsonString);
+        const client = await getClient();
+        const db = client.db('company_explorer');
+        const collection = db.collection('companies');
 
-        const q = query.toLowerCase();
-        const matches = index.filter(item => item.n.includes(q) || (item.c && item.c.toLowerCase().includes(q))).slice(0, 50);
+        // Search using regex for partial match on name or cin
+        const results = await collection.find({
+            $or: [
+                { name: { $regex: query, $options: 'i' } },
+                { cin: { $regex: query, $options: 'i' } }
+            ]
+        })
+            .limit(50)
+            .toArray();
 
-        const results: Company[] = [];
+        const mappedResults: Company[] = results.map(row => ({
+            id: row._id.toString(),
+            name: row.name,
+            state: row.state || '',
+            cin: row.cin,
+            status: row.status,
+            ...row.raw_data
+        }));
 
-        for (const match of matches) {
-            try {
-                const filePath = path.join(DATA_DIR, match.f);
-                const fd = fs.openSync(filePath, 'r');
-                const buffer = Buffer.alloc(match.l);
-                fs.readSync(fd, buffer, 0, match.l, match.b);
-                fs.closeSync(fd);
-
-                const line = buffer.toString('utf-8');
-                // Simple CSV parse
-                const values: string[] = [];
-                let inQuote = false;
-                let currentVal = '';
-                for (let i = 0; i < line.length; i++) {
-                    const char = line[i];
-                    if (char === '"') inQuote = !inQuote;
-                    else if (char === ',' && !inQuote) {
-                        values.push(currentVal.trim());
-                    }
+        return {
+            results: mappedResults,
+            remaining,
+            isPremium: isLoggedIn
+        };
+    } catch (error) {
+        console.error('Database search failed:', error);
+        return { results: [] };
+    }
+}
