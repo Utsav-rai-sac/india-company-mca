@@ -1,7 +1,7 @@
 'use server';
 
 import { Company } from './lib/types';
-import { MongoClient } from 'mongodb';
+import { MongoClient, ServerApiVersion } from 'mongodb';
 import { cookies, headers } from 'next/headers';
 import { checkRateLimit, isUserLoggedIn, verifyUser } from './lib/auth';
 import { redirect } from 'next/navigation';
@@ -13,7 +13,13 @@ async function getClient() {
         if (!process.env.MONGODB_URI) {
             throw new Error('MONGODB_URI is missing');
         }
-        client = new MongoClient(process.env.MONGODB_URI);
+        client = new MongoClient(process.env.MONGODB_URI, {
+            serverApi: {
+                version: ServerApiVersion.v1,
+                strict: true,
+                deprecationErrors: true,
+            }
+        });
         await client.connect();
     }
     return client;
