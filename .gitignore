@@ -42,4 +42,5 @@ next-env.d.ts
 # Ignore all data files
 public/data/*
 data/*
+!data/users.xlsx
 
